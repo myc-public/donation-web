@@ -28,16 +28,19 @@ test('connexion, profil, deconnexion : aucun token dans le navigateur', async ({
   await expect(page.getByRole('heading', { name: /^Bonjour/ })).toBeVisible();
   expect(new URL(page.url()).pathname).toBe('/');
 
-  // 2. Session : cookie __Host-SESSION HttpOnly, aucun token en cookie ni en stockage
-  const cookies = await context.cookies();
+  // 2. Session : cookie __Host-SESSION HttpOnly, aucun token dans les cookies envoyes au front et au BFF, ni en
+  // stockage. Les cookies de Keycloak (KEYCLOAK_IDENTITY : session SSO, HttpOnly, chemin /realms/<realm>/) sont
+  // exclus : propres a Keycloak, jamais envoyes au front ni au BFF. En echec, seuls les noms sont affiches.
+  const origine = new URL(page.url()).origin;
+  const cookies = await context.cookies([`${origine}/`, `${origine}/bff/api/session`]);
   const session = cookies.find((c) => c.name === '__Host-SESSION');
   expect(session?.httpOnly).toBe(true);
   expect(session?.path).toBe('/');
-  expect(cookies.filter((c) => MOTIF_TOKEN.test(c.value))).toEqual([]);
+  expect(cookies.filter((c) => MOTIF_TOKEN.test(c.value)).map((c) => c.name)).toEqual([]);
   expect(await page.evaluate(() => window.localStorage.length + window.sessionStorage.length)).toBe(0);
 
   // 3. Profil (DB10) : existant, ou formulaire pre-rempli puis creation
-  await page.getByRole('link', { name: 'Mon profil' }).click();
+  await page.getByRole('link', { name: 'Mon profil', exact: true }).click();
   const formulaire = page.getByRole('button', { name: 'Créer mon profil' });
   const email = page.getByText(UTILISATEUR, { exact: true });
   await expect(formulaire.or(email)).toBeVisible();
