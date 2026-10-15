@@ -24,7 +24,7 @@ Deconnexion : formulaire `POST /bff/logout` avec le champ `_csrf` (navigation pl
 - Mutations : `credentials: 'same-origin'` et en-tete `X-XSRF-TOKEN` (cookie `XSRF-TOKEN` pose par le BFF).
 - Build : `scripts/check-dist.mjs` fait echouer `npm run build` si `dist/index.html` contient un script ou un style en
   ligne (CSP fixe sans `'unsafe-inline'`).
-- nginx : CSP (`Report-Only` pour l'instant), `index.html` jamais en cache, `/assets/*` en cache un an, GET/HEAD
+- nginx : CSP bloquante, `index.html` jamais en cache, `/assets/*` en cache un an, GET/HEAD
   seulement, `/bff/*` jamais servi.
 
 ## Prerequis
