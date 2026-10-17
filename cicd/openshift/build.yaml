@@ -1,0 +1,33 @@
+# Build d'image a partir de dist/ et nginx/ (build binaire), applique par la pipeline (stage "Build Image").
+# Namespace = celui du ServiceAccount Jenkins. Le nom doit correspondre a gitops.app (jenkins.properties).
+# Image de base fixee par le Dockerfile (nginx UBI 9, epinglee par digest) : pas de dockerStrategy.from.
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: donation-web
+  labels:
+    app: donation-web
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: donation-web
+  labels:
+    app: donation-web
+spec:
+  runPolicy: Serial
+  successfulBuildsHistoryLimit: 5
+  failedBuildsHistoryLimit: 5
+
+  source:
+    type: Binary
+    binary: {}
+
+  strategy:
+    type: Docker
+    dockerStrategy: {}
+
+  output:
+    to:
+      kind: ImageStreamTag
+      name: donation-web:latest
