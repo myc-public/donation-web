@@ -1,0 +1,375 @@
+#!/usr/bin/env groovy
+
+// CI du front donation-web (K6a, DF1-DF4) : meme modele que inner-donation-api (parametre BRANCH,
+// jenkins.properties, image par BuildConfig, tag immuable, Update GitOps), outillage Node a la place de Maven.
+// Pas de publication dans Nexus : l'image est le livrable (dist/ y est entierement contenu).
+
+final jenkinsProperties = 'cicd/jenkins.properties'
+APPLICATION_NAME = ""
+GIT_REPO = ""
+NOTIFICATION_MAIL = ""
+TARGET_BRANCH = ""
+RELEASE_TYPE = ""
+VERSION = ""
+GITOPS_URL = ""
+GITOPS_APP = ""
+GITOPS_ENV = ""
+SONAR_PROJECT_KEY = ""
+IMAGE_TAG = ""
+IMAGE_DIGEST = ""
+OPENSHIFT_NAMESPACE = ""
+
+// D6-12 : commande npm qui telecharge des paquets (npm ci, npx), par le proxy npm de Nexus. Le .npmrc n'existe que
+// le temps de la commande (supprime meme en cas d'echec) : sans lui, les autres etapes npm ne lisent aucun identifiant.
+// Identifiant Nexus jamais ecrit en clair : le .npmrc reference NPM_AUTH, lu par npm dans l'environnement.
+def npmViaNexus(String npmCommand) {
+    withCredentials([usernamePassword(credentialsId: 'nexus-credentials', usernameVariable: 'NEXUS_USERNAME', passwordVariable: 'NEXUS_PASSWORD')]) {
+        withEnv(["NPM_COMMAND=${npmCommand}"]) {
+            sh '''
+                set -eu
+                REGISTRY="${NEXUS_URL%/}/repository/npm-proxy/"
+                HOTE="${REGISTRY#*://}"
+                NPM_AUTH="$(printf '%s:%s' "$NEXUS_USERNAME" "$NEXUS_PASSWORD" | base64 | tr -d '\\n')"
+                export NPM_AUTH
+                umask 077
+                trap 'rm -f "$HOME/.npmrc"' EXIT
+                {
+                    echo "registry=${REGISTRY}"
+                    echo "//${HOTE}:_auth=\\${NPM_AUTH}"
+                } > "$HOME/.npmrc"
+                eval "$NPM_COMMAND"
+            '''
+        }
+    }
+}
+
+pipeline {
+    agent {
+        kubernetes {
+            cloud 'openshift'
+            inheritFrom 'nodejs'
+            agentContainer 'node'
+            agentInjection true
+        }
+    }
+
+    options {
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        choice(name: 'BRANCH', choices: ['develop', 'uat', 'preprod', 'main'], description: 'Git Branch to be used by the build')
+    }
+
+    stages {
+
+        // Doit passer AVANT le checkout : la branche choisie determine quoi cloner et le suffixe de version
+        stage('Init Parameters') {
+            steps {
+                script {
+                    def allowedBranches = ['develop', 'uat', 'preprod', 'main']
+                    if (!(params.BRANCH in allowedBranches)) {
+                        error("Parametre BRANCH invalide : '${params.BRANCH}' (attendu : ${allowedBranches.join(', ')})")
+                    }
+                    TARGET_BRANCH = params.BRANCH
+                    RELEASE_TYPE  = (TARGET_BRANCH == 'main') ? 'RELEASE' : 'SNAPSHOT'
+                    echo "Branche GitHub : ${TARGET_BRANCH} | Type : ${RELEASE_TYPE}"
+                }
+            }
+        }
+
+        stage('Workspace Cleanup') {
+            steps {
+                echo 'Nettoyage du workspace avant build'
+                deleteDir()
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "*/${TARGET_BRANCH}"]],
+                    userRemoteConfigs: scm.userRemoteConfigs,
+                    extensions: [[$class: 'LocalBranch', localBranch: TARGET_BRANCH]]
+                ])
+                script {
+                    def pkg = readJSON file: 'package.json'
+                    // Version publiee = version de package.json + suffixe impose par la branche
+                    VERSION = "${pkg.version}-${RELEASE_TYPE}".toString()
+                    echo "Version publiee : ${VERSION}"
+                }
+            }
+        }
+
+        stage('Init environment') {
+            steps {
+                script {
+                    def props = readProperties file: jenkinsProperties
+                    APPLICATION_NAME    = props["application.name"]?.trim()
+                    GIT_REPO            = props["git.url"]?.trim()
+                    NOTIFICATION_MAIL   = props["notification.email"]?.trim()
+                    GITOPS_URL          = props["gitops.url"]?.trim()
+                    GITOPS_APP          = props["gitops.app"]?.trim()
+                    SONAR_PROJECT_KEY   = props["sonar.projectKey"]?.trim()
+                    if (!GITOPS_URL || !GITOPS_APP || !SONAR_PROJECT_KEY) {
+                        error("gitops.url, gitops.app et sonar.projectKey doivent etre renseignes dans cicd/jenkins.properties")
+                    }
+                    echo "Repo (jenkins.properties) : ${GIT_REPO}"
+                }
+            }
+        }
+
+        stage('Toolchain Validation') {
+            steps {
+                script {
+                    def nodeVersion = sh(script: 'node --version', returnStdout: true).trim()
+                    def npmVersion = sh(script: 'npm --version', returnStdout: true).trim()
+                    echo "Node ${nodeVersion} | npm ${npmVersion}"
+                    // engines de package.json : Node 24 LTS
+                    if (!nodeVersion.startsWith('v24.')) {
+                        error("Node 24 requis - version detectee : ${nodeVersion}")
+                    }
+                }
+            }
+        }
+
+        // package-lock.json pointe vers registry.npmjs.org : npm ci le remplace par le registre configure (Nexus)
+        stage('Install dependencies') {
+            steps {
+                script {
+                    npmViaNexus('npm ci --no-audit')
+                }
+            }
+        }
+
+        stage('Lint & Typecheck') {
+            steps {
+                sh 'npm run lint'
+                sh 'npm run typecheck'
+            }
+        }
+
+        stage('Unit tests') {
+            steps {
+                sh 'npm test'
+            }
+        }
+
+        // Nexus OSS ne sert pas l'API d'audit npm : interrogation directe de registry.npmjs.org
+        // (seuls les noms et versions des paquets sont envoyes)
+        stage('Dependency audit') {
+            steps {
+                sh 'npm run audit'
+            }
+        }
+
+        stage('Sonar Code analysis') {
+            steps {
+                // Memes limites que l'API (plan SonarCloud gratuit) : pas de sonar.branch.name, Quality Gate synchrone.
+                // Scanner npm (version epinglee) par Nexus ; jeton de Jenkins (SONAR_AUTH_TOKEN) passe par l'environnement
+                withSonarQubeEnv('sonarqube') {
+                    withEnv(["SONAR_PROJECT_KEY=${SONAR_PROJECT_KEY}"]) {
+                        script {
+                            npmViaNexus('SONAR_TOKEN="$SONAR_AUTH_TOKEN" npx --yes @sonar/scan@5.0.1 ' +
+                                '-Dsonar.host.url="$SONAR_HOST_URL" ' +
+                                '-Dsonar.organization=myc-public ' +
+                                '-Dsonar.projectKey="$SONAR_PROJECT_KEY" ' +
+                                '-Dsonar.sources=src ' +
+                                '-Dsonar.tests=src ' +
+                                "-Dsonar.test.inclusions='src/**/*.test.ts,src/**/*.test.tsx' " +
+                                "-Dsonar.exclusions='src/**/*.test.ts,src/**/*.test.tsx,src/test-setup.ts,src/test-utils.tsx' " +
+                                '-Dsonar.qualitygate.wait=true ' +
+                                '-Dsonar.qualitygate.timeout=300')
+                        }
+                    }
+                }
+            }
+        }
+
+        // tsc -b && vite build, puis controle de dist/ (CSP fixe : aucun script ni style en ligne)
+        stage('Build') {
+            steps {
+                sh 'npm run build'
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                script {
+                    // git n'est pas dans l'image node:slim : commandes git dans le conteneur jnlp
+                    def gitShort = ''
+                    container('jnlp') {
+                        gitShort = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+                    }
+                    IMAGE_TAG = "${VERSION}-${gitShort}-b${env.BUILD_NUMBER}".toString()
+                    OPENSHIFT_NAMESPACE = sh(script: 'cat /var/run/secrets/kubernetes.io/serviceaccount/namespace', returnStdout: true).trim()
+
+                    // Contexte = dist/ et nginx/ (comme .dockerignore), Dockerfile a la racine du contexte
+                    sh '''
+                        rm -rf image-context && mkdir -p image-context
+                        cp -r dist nginx image-context/
+                        cp cicd/openshift/Dockerfile image-context/Dockerfile
+                    '''
+
+                    withEnv(["IMAGE_NAME=${GITOPS_APP}", "IMAGE_TAG=${IMAGE_TAG}"]) {
+                        container('oc') {
+                            sh '''
+                                set -eu
+                                oc apply -f cicd/openshift/build.yaml
+                                oc start-build "bc/${IMAGE_NAME}" --from-dir=image-context --follow --wait
+                                oc tag "${IMAGE_NAME}:latest" "${IMAGE_NAME}:${IMAGE_TAG}"
+                                oc get istag "${IMAGE_NAME}:${IMAGE_TAG}" -o jsonpath='{.image.metadata.name}' > image-digest.txt
+                            '''
+                        }
+                    }
+                    IMAGE_DIGEST = readFile('image-digest.txt').trim()
+                    if (!IMAGE_DIGEST) {
+                        error("Image ${GITOPS_APP}:${IMAGE_TAG} introuvable dans le registry apres le build")
+                    }
+                    echo "Image poussee : ${OPENSHIFT_NAMESPACE}/${GITOPS_APP}:${IMAGE_TAG} (${IMAGE_DIGEST})"
+                }
+            }
+        }
+
+        // Ecrit le tag dans le depot GitOps (overlay de l'environnement) ; Argo CD synchronise ensuite.
+        //   develop -> overlays/dev  : commit direct sur main (deploiement automatique)
+        //   autres  -> branche promote/... a merger par PR (uat, preprod, prod)
+        stage('Update GitOps') {
+            steps {
+                script {
+                    def envByBranch = [develop: 'dev', uat: 'uat', preprod: 'preprod', main: 'prod']
+                    GITOPS_ENV = envByBranch[TARGET_BRANCH]
+                    def directCommit = (GITOPS_ENV == 'dev') ? 'true' : 'false'
+
+                    withCredentials([usernamePassword(credentialsId: 'gitops-git-credentials', usernameVariable: 'GITOPS_USER', passwordVariable: 'GITOPS_TOKEN')]) {
+                        withEnv(["GITOPS_URL=${GITOPS_URL}", "GITOPS_APP=${GITOPS_APP}", "GITOPS_ENV=${GITOPS_ENV}",
+                                 "IMAGE_TAG=${IMAGE_TAG}", "DIRECT_COMMIT=${directCommit}"]) {
+                            // git n'est pas dans l'image node:slim : etape dans le conteneur jnlp
+                            container('jnlp') {
+                                sh '''
+                                    set -eu
+                                    # Identifiants fournis via GIT_ASKPASS : rien dans l'URL ni dans les logs
+                                    ASKPASS="$(pwd)/git-askpass.sh"
+                                    cat > "$ASKPASS" <<'EOF'
+#!/bin/sh
+case "$1" in
+  Username*) printf '%s' "$GITOPS_USER" ;;
+  *)         printf '%s' "$GITOPS_TOKEN" ;;
+esac
+EOF
+                                    chmod 700 "$ASKPASS"
+                                    export GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0
+
+                                    rm -rf gitops
+                                    git clone --depth 1 --branch main "$GITOPS_URL" gitops
+                                    cd gitops
+
+                                    OVERLAY="apps/${GITOPS_APP}/overlays/${GITOPS_ENV}/kustomization.yaml"
+                                    [ -f "$OVERLAY" ] || { echo "Overlay introuvable dans le depot GitOps : $OVERLAY"; exit 1; }
+
+                                    sed -i -E "s|^([[:space:]]*newTag:).*|\\1 ${IMAGE_TAG}|" "$OVERLAY"
+                                    grep -q "newTag: ${IMAGE_TAG}$" "$OVERLAY" || { echo "Mise a jour de newTag impossible dans $OVERLAY"; exit 1; }
+
+                                    if git diff --quiet; then
+                                        echo "GitOps deja a jour (${IMAGE_TAG})"
+                                        git rev-parse HEAD > ../gitops-commit.txt
+                                        exit 0
+                                    fi
+
+                                    git -c user.name="jenkins-ci" -c user.email="jenkins-ci@users.noreply.github.com" \\
+                                        commit -q -am "chore(${GITOPS_APP}): ${GITOPS_ENV} -> ${IMAGE_TAG} [build ${BUILD_NUMBER}]"
+                                    git rev-parse HEAD > ../gitops-commit.txt
+
+                                    if [ "$DIRECT_COMMIT" = "true" ]; then
+                                        pushed=0
+                                        for attempt in 1 2 3; do
+                                            if git push -q origin HEAD:main; then pushed=1; break; fi
+                                            git pull -q --rebase origin main
+                                        done
+                                        [ "$pushed" = "1" ] || { echo "Push GitOps en echec apres 3 tentatives"; exit 1; }
+                                        echo "GitOps mis a jour : ${GITOPS_APP} ${GITOPS_ENV} -> ${IMAGE_TAG}"
+                                    else
+                                        PROMOTE_BRANCH="promote/${GITOPS_APP}-${GITOPS_ENV}-${IMAGE_TAG}"
+                                        git push -q origin "HEAD:refs/heads/${PROMOTE_BRANCH}"
+                                        echo "Branche ${PROMOTE_BRANCH} poussee : ouvrir une Pull Request vers main pour deployer en ${GITOPS_ENV}"
+                                    fi
+                                '''
+                            }
+                        }
+                    }
+
+                    def gitopsCommit = readFile('gitops-commit.txt').trim()
+                    def imageVersion = """\
+image=image-registry.openshift-image-registry.svc:5000/${OPENSHIFT_NAMESPACE}/${GITOPS_APP}
+tag=${IMAGE_TAG}
+digest=${IMAGE_DIGEST}
+gitops.environment=${GITOPS_ENV}
+gitops.commit=${gitopsCommit}
+artifact.version=${VERSION}
+jenkins.buildNumber=${env.BUILD_NUMBER}
+"""
+                    writeFile file: 'image-version.properties', text: imageVersion
+                    echo imageVersion
+                }
+                archiveArtifacts artifacts: 'image-version.properties', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'clean up our workspace'
+            deleteDir()
+        }
+        success {
+            script {
+                if (NOTIFICATION_MAIL) {
+                    try {
+                        mail to: NOTIFICATION_MAIL,
+                             subject: "[${APPLICATION_NAME}] BUILD SUCCESS #${env.BUILD_NUMBER} (${params.BRANCH})",
+                             body: """\
+Build reussi.
+
+Application : ${APPLICATION_NAME}
+Branche     : ${params.BRANCH}
+Version     : ${VERSION}
+Image       : ${IMAGE_TAG}
+Build       : ${env.BUILD_NUMBER}
+URL         : ${env.BUILD_URL}
+"""
+                    } catch (Exception e) {
+                        echo "Envoi du mail de notification impossible (SMTP non configure sur Jenkins ?) : ${e.getMessage()}"
+                    }
+                } else {
+                    echo "Notification email non envoyee : notification.email n'est pas renseigne dans cicd/jenkins.properties."
+                }
+            }
+        }
+        failure {
+            script {
+                if (NOTIFICATION_MAIL) {
+                    try {
+                        mail to: NOTIFICATION_MAIL,
+                             subject: "[${APPLICATION_NAME}] BUILD FAILURE #${env.BUILD_NUMBER} (${params.BRANCH})",
+                             body: """\
+Le build a echoue.
+
+Application : ${APPLICATION_NAME}
+Branche     : ${params.BRANCH}
+Build       : ${env.BUILD_NUMBER}
+Logs        : ${env.BUILD_URL}console
+"""
+                    } catch (Exception e) {
+                        echo "Envoi du mail de notification impossible (SMTP non configure sur Jenkins ?) : ${e.getMessage()}"
+                    }
+                } else {
+                    echo "Notification email non envoyee : notification.email n'est pas renseigne dans cicd/jenkins.properties."
+                }
+            }
+        }
+    }
+}
