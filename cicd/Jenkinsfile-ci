@@ -48,8 +48,9 @@ pipeline {
         kubernetes {
             cloud 'openshift'
             inheritFrom 'nodejs'
-            agentContainer 'node'
-            agentInjection true
+            // Pas d'injection de l'agent (Java absent de l'image node) : conteneur jnlp standard (Java, git),
+            // etapes executees dans le conteneur node
+            defaultContainer 'node'
         }
     }
 
