@@ -5,7 +5,7 @@ environnement : la connexion, la session et les appels a l'API passent par le BF
 [`web-bff`](https://github.com/myc-public/web-bff), sur la meme origine (`/bff/**`).
 
 Flux : Navigateur -> APISIX externe + WAF -> `/` **donation-web** (nginx) ; `/bff/**` -> web-bff -> APISIX interne ->
-donation-api. Decisions : ADR K6 DF1 a DF4 et DB1 a DB11 (`jenkins-on-openshift-with-terraform/docs/ROADMAP.md`).
+donation-api. Decisions : ADR K6 DF1 a DF4 et DB1 a DB11 (ADR 0026 de `platform-handbook` : https://github.com/myc-public/platform-handbook/blob/develop/adr/README.md).
 Tests de securite : `inner-donation-api/postman/PLAN-DE-TEST-E2E.md` section 5.
 
 ## Pages
