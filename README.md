@@ -54,7 +54,11 @@ Vite relaie `/bff` vers le BFF (8090) en conservant l'en-tete Host : le navigate
 | `npm run test:e2e` | parcours navigateur reel (Playwright) : `E2E_BASE_URL`, `E2E_USER`, `E2E_PASSWORD` |
 | `npm run audit` | vulnerabilites connues des dependances de production (seuil : high) |
 
-## Image
+## CI/CD et image
+
+Job Jenkins `donation-web` ([`cicd/Jenkinsfile-ci`](cicd/Jenkinsfile-ci)) : `npm ci` par le proxy npm de Nexus, lint et
+typecheck, tests, audit des dependances, SonarCloud, build, image (BuildConfig), puis mise a jour du tag dans
+`gitops-platform` (`apps/donation-web/overlays/dev`), synchronise par Argo CD.
 
 `cicd/openshift/Dockerfile` : nginx 1.26 UBI 9 (digest), contexte = racine du depot apres `npm run build`
 (`.dockerignore` : `dist/` et `nginx/` seulement), UID arbitraire (groupe 0), port 8080, sonde `/healthz` jamais
