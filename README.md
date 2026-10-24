@@ -5,7 +5,7 @@ environnement : la connexion, la session et les appels a l'API passent par le BF
 [`web-bff`](https://github.com/myc-public/web-bff), sur la meme origine (`/bff/**`).
 
 Flux : Navigateur -> APISIX externe + WAF -> `/` **donation-web** (nginx) ; `/bff/**` -> web-bff -> APISIX interne ->
-donation-api. Decisions : ADR K6 DF1 a DF4 et DB1 a DB11 (`jenkins-on-openshift-with-terraform/docs/ROADMAP.md`).
+donation-api. Decisions : ADR K6 DF1 a DF4 et DB1 a DB11 (ADR 0026 de `platform-handbook` : https://github.com/myc-public/platform-handbook/blob/develop/adr/README.md).
 Tests de securite : `inner-donation-api/postman/PLAN-DE-TEST-E2E.md` section 5.
 
 ## Pages
@@ -54,7 +54,11 @@ Vite relaie `/bff` vers le BFF (8090) en conservant l'en-tete Host : le navigate
 | `npm run test:e2e` | parcours navigateur reel (Playwright) : `E2E_BASE_URL`, `E2E_USER`, `E2E_PASSWORD` |
 | `npm run audit` | vulnerabilites connues des dependances de production (seuil : high) |
 
-## Image
+## CI/CD et image
+
+Job Jenkins `donation-web` ([`cicd/Jenkinsfile-ci`](cicd/Jenkinsfile-ci)) : `npm ci` par le proxy npm de Nexus, lint et
+typecheck, tests, audit des dependances, SonarCloud, build, image (BuildConfig), puis mise a jour du tag dans
+`gitops-platform` (`apps/donation-web/overlays/dev`), synchronise par Argo CD.
 
 `cicd/openshift/Dockerfile` : nginx 1.26 UBI 9 (digest), contexte = racine du depot apres `npm run build`
 (`.dockerignore` : `dist/` et `nginx/` seulement), UID arbitraire (groupe 0), port 8080, sonde `/healthz` jamais
